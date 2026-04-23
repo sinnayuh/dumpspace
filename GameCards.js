@@ -7,6 +7,7 @@ const UnityWidget = document.getElementById("unity-cards");
 const gameListDiv = document.getElementById("gameListDiv");
 const allGamesOpener = document.getElementById("allGamesOpener");
 const allGamesDiv = document.getElementById("allGamesDiv");
+const allGamesDivCloser = document.getElementById("allGamesDivCloser");
 const sortButton = document.getElementById("sortButton");
 
 const currentPath =
@@ -306,11 +307,11 @@ function handleSearchInput() {
     searchCancelButton.classList.remove("hidden");
   } else searchCancelButton.classList.add("hidden");
   if (filter === "") {
-    for (i = 0; i < gameArray.length; i++) {
+    for (let i = 0; i < gameArray.length; i++) {
       createAndPushGameToList(gameArray[i]);
     }
   } else {
-    for (i = 0; i < gameArray.length; i++) {
+    for (let i = 0; i < gameArray.length; i++) {
       if (gameArray[i].name.toUpperCase().includes(filter) === true) {
         createAndPushGameToList(gameArray[i]);
       }

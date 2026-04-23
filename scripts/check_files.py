@@ -49,26 +49,37 @@ start_sha = pr.head.sha
 
 print(f"Start head SHA: {start_sha}")
 
+# Populated by get_file_arrays(): maps PR file path -> blob SHA. Lets
+# get_content_by_name fetch the blob directly instead of doing a separate
+# get_contents() call just to look up the SHA.
+_pr_file_sha_cache = {}
+
 def get_file_arrays():
-
-  # Get the diff of the pull request compared to the 'main' branch
-
+  # Classify every file in the PR by its GitHub status. Auto-merge only handles
+  # 'added' and 'modified'; everything else ('removed', 'renamed', 'copied',
+  # 'changed', 'unchanged') is collected into other_files so main() can bail
+  # out with a clear message.
   print(f"looking up pr {pr.number}: {pr.merge_commit_sha}")
-  #  Get the file changes between the pull request branch and the main branch
-  files = pr.get_files()
+  files = list(pr.get_files())
   for file in files:
     print(f"{file.filename} : {file.status}")
+    _pr_file_sha_cache[file.filename] = file.sha
 
-  file_names = [file.filename for file in files]
-  added_files = [file.filename for file in files if file.status == 'added']
-  deleted_files = [file.filename for file in files if file.status == 'deleted']
+  added_files = [f.filename for f in files if f.status == 'added']
+  modified_files = [f.filename for f in files if f.status == 'modified']
+  other_files = [(f.filename, f.status) for f in files if f.status not in ('added', 'modified')]
 
-  return file_names, added_files, deleted_files
+  return added_files, modified_files, other_files
 
 def get_content_by_name(filename):
-  blob = repo.get_git_blob(repo.get_contents(filename, ref=pr.head.sha).sha)
-  b64 = base64.b64decode(blob.content)
-  return b64.decode("utf8")
+  # Use the SHA cached from pr.get_files() so we skip the separate
+  # get_contents() round-trip. Fall back to a contents lookup only if the
+  # cache miss is real (shouldn't happen in normal flow).
+  sha = _pr_file_sha_cache.get(filename)
+  if sha is None:
+    sha = repo.get_contents(filename, ref=pr.head.sha).sha
+  blob = repo.get_git_blob(sha)
+  return base64.b64decode(blob.content).decode("utf8")
 
 
 def write_to_env(var, value):
@@ -141,14 +152,14 @@ def basic_check(files):
     st = "A file is not in 3 subfolders. All files have to be in Games/(engine)/(Game)."
     print(st)
     return False, st
-  
-  
-  if any(folder1 not in file_name.split('/')[0] for file_name in files):
+
+
+  if any(file_name.split('/')[0] != folder1 for file_name in files):
     st = "A file is not in the Games folder. All files have to be in Games/(engine)/(Game)/."
     print(st)
     return False, st
-  
-  if any(all(folder2 not in file_name.split('/')[1] for folder2 in folder2_options) for file_name in files):
+
+  if any(file_name.split('/')[1] not in folder2_options for file_name in files):
     st = "A file is not in any supported engine (" + ', '.join(folder2_options) + ") folder. New engines are not supported by default."
     print(st)
     return False, st
@@ -471,51 +482,53 @@ def check_added_files(added_files):
   
 
 def main():
-  changed_files, added_files, deleted_files = get_file_arrays()
+  added_files, modified_files, other_files = get_file_arrays()
 
-  print("Changed files:", changed_files)
   print("Added files:", added_files)
-  print("Deleted files:", deleted_files)
+  print("Modified files:", modified_files)
+  print("Other (disallowed) files:", other_files)
 
-  # Note: The logic here assumes that changed_files is a superset of added_files,
-  # which is how the GitHub API presents files in a PR. `added_files` is just a filter.
-  # If a file is added, it's in both lists. If modified, it's only in `changed_files`.
-  # The original logic of checking `changed_files` and `added_files` separately is fine.
-  
-  files_to_check = changed_files if changed_files else added_files
-
-  if not files_to_check:
-      print("No files to process.")
-      return
-
-  if added_files and (set(changed_files) != set(added_files)):
-      print("Mixing added and modified files in this way is not supported.")
-      env_comment("failure", "Mixed added and modified files are not allowed.")
-      return
-    
-	
-  if deleted_files:
-    print("Deleted files cannot be processed automatically.")
-    env_comment("failure", "Deleted files cannot be processed automatically.")
+  # Auto-merge is only for game dump uploads. Anything that isn't a plain add
+  # or modify (removed, renamed, copied, changed, unchanged) blocks merge.
+  if other_files:
+    statuses = ', '.join(sorted({status for _, status in other_files}))
+    paths = ', '.join(sorted({path for path, _ in other_files}))
+    env_comment(
+      "failure",
+      "This PR contains files with unsupported change types (" + statuses + "): " + paths +
+      ". Auto-merge only accepts purely new game folders or purely updated game files."
+    )
     return
+
+  if not added_files and not modified_files:
+    print("No game files detected; nothing to auto-merge.")
+    env_comment("failure", "No game files detected in this PR; nothing to auto-merge.")
+    return
+
+  # A PR must be either adding a new game OR updating an existing one, not both.
+  if added_files and modified_files:
+    env_comment(
+      "failure",
+      "This PR mixes added and modified files. Auto-merge requires either purely new game files or purely updated game files."
+    )
+    return
+
+  files_to_check = added_files if added_files else modified_files
 
   _bRes, _sRes = basic_check(files_to_check)
   if not _bRes:
     env_comment("failure", _sRes)
     return
-  
-  # Determine if we are adding a new game or updating an existing one
-  if all(file in added_files for file in files_to_check):
+
+  if added_files:
     print("--- Running ADD files logic ---")
     bRes, sRes = check_added_files(added_files)
   else:
     print("--- Running CHANGE files logic ---")
-    bRes, sRes = check_changed_files(changed_files)
+    bRes, sRes = check_changed_files(modified_files)
 
-
-  # This check for changes during commit might be less reliable now since
-  # the single commit happens faster, but it's still a good safeguard.
-  pr.update() # Refresh PR data
+  # Safeguard: if the PR was amended while we were processing it, don't merge.
+  pr.update()
   print(f"Current head SHA after processing: {pr.head.sha}")
 
   if pr.head.sha != start_sha:

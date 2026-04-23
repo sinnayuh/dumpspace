@@ -1,12 +1,26 @@
 function formatElapsedTime(currentTime, givenTime, elem) {
-  const timeElapsed = currentTime - givenTime;
+  // Timestamps in the JSON files are stored as strings (e.g. "1754865841994").
+  // `new Date(string-of-digits)` tries to parse it as a date format and returns
+  // Invalid Date, which makes getMonth/getFullYear return NaN. Coerce to Number
+  // before constructing the Date.
+  const currentTimeMs = Number(currentTime);
+  const givenTimeMs = Number(givenTime);
+  const timeElapsed = currentTimeMs - givenTimeMs;
   const secondsInMilli = 1000;
   const minutesInMilli = 60 * secondsInMilli;
   const hoursInMilli = 60 * minutesInMilli;
   const daysInMilli = 24 * hoursInMilli;
   const weeksInMilli = 7 * daysInMilli;
-  const monthsInMilli = 30 * daysInMilli;
-  const yearsInMilli = 365 * daysInMilli;
+
+  // Calendar-based month/year so we never display "12 months ago".
+  const now = new Date(currentTimeMs);
+  const then = new Date(givenTimeMs);
+  let monthsElapsed =
+    (now.getFullYear() - then.getFullYear()) * 12 +
+    (now.getMonth() - then.getMonth());
+  if (now.getDate() < then.getDate()) monthsElapsed--;
+  if (monthsElapsed < 0) monthsElapsed = 0;
+  const yearsElapsed = Math.floor(monthsElapsed / 12);
 
   let timeElapsedString = "";
   elem.classList.add("text-slate-700", "dark:text-slate-100");
@@ -22,23 +36,21 @@ function formatElapsedTime(currentTime, givenTime, elem) {
   } else if (timeElapsed < weeksInMilli) {
     const val = Math.floor(timeElapsed / daysInMilli);
     timeElapsedString = val + " day" + (val > 1 ? "s" : "");
-  } else if (timeElapsed < monthsInMilli) {
+  } else if (monthsElapsed < 1) {
     const val = Math.floor(timeElapsed / weeksInMilli);
     timeElapsedString = val + " week" + (val > 1 ? "s" : "");
-  } else if (timeElapsed < yearsInMilli) {
-    const val = Math.floor(timeElapsed / monthsInMilli);
-    timeElapsedString = val + " month" + (val > 1 ? "s" : "");
-    if (val >= 1) {
-      elem.classList.remove("text-slate-700", "dark:text-slate-100");
-      if (val >= 6) {
-        elem.classList.add("text-red-500");
-      } else {
-        elem.classList.add("text-amber-500");
-      }
+  } else if (yearsElapsed < 1) {
+    timeElapsedString =
+      monthsElapsed + " month" + (monthsElapsed > 1 ? "s" : "");
+    elem.classList.remove("text-slate-700", "dark:text-slate-100");
+    if (monthsElapsed >= 6) {
+      elem.classList.add("text-red-500");
+    } else {
+      elem.classList.add("text-amber-500");
     }
   } else {
-    const years = Math.floor(timeElapsed / yearsInMilli);
-    timeElapsedString = years + " year" + (years > 1 ? "s" : "");
+    timeElapsedString =
+      yearsElapsed + " year" + (yearsElapsed > 1 ? "s" : "");
     elem.classList.add("text-red-500");
   }
   elem.textContent = timeElapsedString + " ago";

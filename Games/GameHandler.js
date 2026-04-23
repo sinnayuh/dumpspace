@@ -48,6 +48,9 @@ function getGameInfo(info, reload = true, newWindow = false, push = true) {
   newURL += "hash=" + UrlParams["hash"] + "&type=" + info;
 
   if (UrlParams["sha"]) newURL += "&sha=" + UrlParams["sha"];
+  // Carry the diff comparison across tab switches so the user doesn't have
+  // to re-trigger it from the history modal each time.
+  if (UrlParams["diff"]) newURL += "&diff=" + UrlParams["diff"];
 
   if (newWindow) {
     window.open(newURL, "_blank");
@@ -130,15 +133,17 @@ async function reloadWithNewCName(CName, newType, member, newWindow = false) {
 
   if (member) {
     newURL += "&idx=" + CName + "&member=" + member;
-    console.log("[reloadWithNewCName] pushing " + newURL);
-    if (newWindow) window.open(newURL, "_blank");
-    else history.pushState(null, null, newURL);
   } else {
     newURL += "&idx=" + CName;
-    console.log("[reloadWithNewCName] pushing " + newURL);
-    if (newWindow) window.open(newURL, "_blank");
-    else history.pushState(null, null, newURL);
   }
+  // Carry the active comparison across cross-type member navigation, so
+  // clicking a struct member from a class keeps the diff loaded.
+  if (UrlParams["sha"]) newURL += "&sha=" + UrlParams["sha"];
+  if (UrlParams["diff"]) newURL += "&diff=" + UrlParams["diff"];
+
+  console.log("[reloadWithNewCName] pushing " + newURL);
+  if (newWindow) window.open(newURL, "_blank");
+  else history.pushState(null, null, newURL);
 
   // Reload the page to apply the changes
   if (!newWindow) location.reload();
@@ -152,25 +157,10 @@ function returnHome() {
   location.reload();
 }
 
-//make sure this is always valid
 const classDiv = document.getElementById("class-list");
-const classDivScroll = document.getElementById("class-list-scroll");
-
-//this is just for some vanillarecylverview to support mobile devices
-if (classDivScroll.offsetHeight == 256)
-  classDivScroll.style.height = 500 + "px";
-
-classDiv.style.height = classDiv.offsetHeight + "px";
-classDiv.style.width = "100%";
-
-window.addEventListener("resize", function () {
-  //support downscaling, upscaling wont work and wont fix, stop resizing ur window
-  //we call this in the tech scene a bandaid fix :)
-  if (window.innerWidth < 1280) {
-    classDivScroll.style.height = 500 + "px";
-    classDiv.style.height = 484 + "px";
-  }
-});
+// Heights for #class-list are driven entirely by Tailwind classes
+// (max-xl:h-64 below xl, xl:flex-1 above) and VirtualList's ResizeObserver
+// re-renders on every container size change. No inline-style juggling.
 
 //current gamelistJSON is alwys empty and gets fetched by the server again
 var GameListJson = null;
@@ -369,6 +359,37 @@ async function displayCurrentGame() {
   }
   //actual baking
   displayCurrentType(targetClassName, member);
+
+  // Shareable diff links: if the URL has ?diff=<sha>, auto-load the diff
+  // once the initial render is in.
+  if (UrlParams["diff"]) {
+    autoApplyDiffFromUrl(UrlParams["diff"]);
+  }
+}
+
+// Look up the commit's date so the banner shows a real label, then activate
+// the diff. Falls back to the short SHA if the API call fails (rate limit,
+// no internet, deleted commit, etc.).
+async function autoApplyDiffFromUrl(sha) {
+  let label = sha.slice(0, 7);
+  try {
+    const resp = await fetch(
+      "https://api.github.com/repos/Spuckwaffel/dumpspace/commits/" + sha,
+    );
+    if (resp.ok) {
+      const c = await resp.json();
+      const date = new Date(c.commit.author.date);
+      const day = String(date.getDate()).padStart(2, "0");
+      const month = date.toLocaleString("en-US", { month: "short" });
+      const year = date.getFullYear();
+      const hours = String(date.getHours()).padStart(2, "0");
+      const minutes = String(date.getMinutes()).padStart(2, "0");
+      label = `${day} ${month} ${year} ${hours}:${minutes}`;
+    }
+  } catch (e) {
+    console.warn("[diff] commit lookup failed", e);
+  }
+  startDiff(sha, label);
 }
 
 //persistent global data
@@ -378,28 +399,89 @@ var focussedCName = null;
 var formattedArrayDataValid = false;
 //the formatted data we display in the vrv
 var formattedArrayData = [];
+//names of classes/structs/functions/enums whose bodies are empty — rendered muted in the list
+var emptyClassNames = new Set();
+//member-name keys that are dumper metadata, not real members. Must match the
+//skip-list in displayOverviewPage() / the C++ output in displayStructAndMDKPage().
+const RESERVED_MEMBER_NAMES = new Set(["__InheritInfo", "__MDKClassSize"]);
 //storing the vrv object
 var dVanillaRecyclerView = null;
 
 var firstScroll = true;
 var focussedCNameVisible = false;
 
+// Build a single row of the class list. Used by VirtualList.renderItem.
+function buildClassListItem(name) {
+  const button = document.createElement("button");
+  button.dataset.name = name;
+  button.classList.add(
+    "px-3",
+    "py-2",
+    "border-b",
+    "border-gray-200",
+    "dark:border-gray-600",
+    "text-left",
+    "w-full",
+    "h-full",
+    "transition",
+    "duration-200",
+    "ease-in-out",
+    "truncate",
+    "flex",
+    "items-center",
+    "gap-2",
+    "hover:bg-gray-600/20",
+  );
+
+  const nameEl = document.createElement("span");
+  nameEl.className = "truncate";
+  nameEl.textContent = name;
+  button.appendChild(nameEl);
+
+  const diffEntry = diffSummary ? diffSummary.get(name) : null;
+  if (diffEntry && diffEntry.status !== "U") {
+    const { badge } = getDiffStatusClasses(diffEntry.status);
+    const badgeEl = document.createElement("span");
+    badgeEl.className =
+      "flex-none ml-auto px-1.5 rounded text-[10px] font-bold leading-tight " +
+      badge;
+    badgeEl.textContent = diffEntry.status;
+    button.appendChild(badgeEl);
+  }
+
+  if (emptyClassNames.has(name)) {
+    button.classList.add("text-slate-400", "dark:text-slate-500");
+  }
+
+  button.addEventListener("mouseup", function (event) {
+    if (event.button === 1) {
+      event.stopPropagation();
+      reloadWithNewCName(name, currentType, null, true);
+    } else {
+      focussedCName = name;
+      fixHighlightColor();
+      displayCurrentType(name);
+    }
+  });
+
+  return button;
+}
+
 function fixHighlightColor() {
-  // Get the child div that contains the buttons
-  var childDiv = classDiv.querySelector("div");
-
-  var divs = childDiv.querySelectorAll("div");
-
-  var found = false;
-  divs.forEach(function (div) {
-    var childButton = div.querySelector("button");
-    if (childButton == null) return;
-    if (focussedCName !== null && focussedCName === childButton.textContent) {
-      childButton.classList.add("bg-gray-600/10");
-
+  if (!classDiv) return;
+  // Walk every visible row's button. With VirtualList that's just the
+  // currently mounted slots — typically ~30 items max.
+  const buttons = classDiv.querySelectorAll("button[data-name]");
+  let found = false;
+  buttons.forEach(function (button) {
+    const buttonName = button.dataset.name;
+    if (focussedCName !== null && focussedCName === buttonName) {
+      button.classList.add("bg-gray-600/10");
+      button.classList.remove("hover:bg-gray-600/20");
       found = true;
     } else {
-      childButton.classList.remove("bg-gray-600/10");
+      button.classList.remove("bg-gray-600/10");
+      button.classList.add("hover:bg-gray-600/20");
     }
   });
   focussedCNameVisible = found;
@@ -437,6 +519,10 @@ function displayCurrentType(CName, member) {
   if (UrlParams["sha"]) {
     newURL += "&sha=" + UrlParams["sha"];
   }
+  // Preserve the active diff so navigating between members doesn't drop it.
+  if (UrlParams["diff"]) {
+    newURL += "&diff=" + UrlParams["diff"];
+  }
 
   const oldURL = currentURL;
   currentURL = window.location.origin + window.location.pathname + newURL;
@@ -451,12 +537,50 @@ function displayCurrentType(CName, member) {
   //get the index scroll and also format the data if never formatted (first run)
   for (const gameClass of currentInfoJson.data) {
     idx++;
-    if (!formattedArrayDataValid)
-      formattedArrayData.push(Object.keys(gameClass)[0]);
+    const name = Object.keys(gameClass)[0];
 
-    if (CName !== null && Object.keys(gameClass)[0] === CName) {
+    if (!formattedArrayDataValid) {
+      formattedArrayData.push(name);
+
+      // Mark entries whose body is empty so the list can render them muted.
+      // For classes/structs we strip dumper-metadata keys (__InheritInfo,
+      // __MDKClassSize, ...) so a class with only metadata still counts as empty.
+      const items = gameClass[name];
+      let isEmpty = false;
+      if (currentType === "E") {
+        isEmpty =
+          !Array.isArray(items) ||
+          !Array.isArray(items[0]) ||
+          items[0].length === 0;
+      } else if (currentType === "C" || currentType === "S") {
+        isEmpty =
+          !Array.isArray(items) ||
+          items.filter(
+            (m) => !RESERVED_MEMBER_NAMES.has(Object.keys(m)[0]),
+          ).length === 0;
+      } else {
+        isEmpty = !Array.isArray(items) || items.length === 0;
+      }
+      if (isEmpty) emptyClassNames.add(name);
+    }
+
+    if (CName !== null && name === CName) {
       scrollToIdx = idx;
       targetGameClass = gameClass;
+    }
+  }
+
+  // In diff mode, append entries that exist in the old version but were
+  // deleted in the current. They appear in the list (with a red D badge) and
+  // are renderable from their old payload.
+  if (diffSummary && deletedEntryNames.length > 0) {
+    for (const delName of deletedEntryNames) {
+      idx++;
+      if (!formattedArrayDataValid) formattedArrayData.push(delName);
+      if (CName !== null && delName === CName) {
+        scrollToIdx = idx;
+        targetGameClass = diffSummary.get(delName).oldEntry;
+      }
     }
   }
 
@@ -497,53 +621,14 @@ function displayCurrentType(CName, member) {
 
   focussedCName = CName;
 
-  //first time? make the vrv
+  //first time? mount the virtualized list
   if (!formattedArrayDataValid) {
-    dVanillaRecyclerView = new VanillaRecyclerView(classDiv, {
+    dVanillaRecyclerView = new VirtualList(classDiv, {
       data: formattedArrayData,
-      renderer: class {
-        initialize(params) {
-          this.layout = document.createElement("button");
-          this.layout.innerHTML = params.data;
-          this.layout.classList.add(
-            "px-3",
-            "py-2",
-            "border-b",
-            "border-gray-200",
-            "dark:border-gray-600",
-            "text-left",
-            "w-full",
-            "transition",
-            "duration-200",
-            "ease-in-out",
-            "hover:text-blue-500",
-            "truncate",
-          );
-          if (targetClassName != null && params.data === targetClassName) {
-            this.layout.classList.add("bg-gray-600/10");
-          }
-          this.layout.addEventListener("mouseup", function (event) {
-            if (event.button === 1) {
-              event.stopPropagation();
-              reloadWithNewCName(params.data, currentType, null, true);
-            } else {
-              //change the focusseddataname
-              focussedCName = params.data;
-              fixHighlightColor();
-              displayCurrentType(params.data);
-            }
-          });
-        }
-        getLayout() {
-          return this.layout;
-        }
-        onUnmount() {}
-        onMount() {
-          fixHighlightColor();
-        }
-      },
+      itemHeight: 50,
+      renderItem: buildClassListItem,
+      onAfterRender: fixHighlightColor,
     });
-
     formattedArrayDataValid = true;
   }
 
@@ -567,6 +652,42 @@ function displayCurrentType(CName, member) {
     classDiv.scrollTop = scrollTo;
   }
 
+  // Inheritance only makes sense for classes and structs — hide the
+  // button + breadcrumb row for functions/enums.
+  const inheritanceRow = document.getElementById("inheritance-row");
+  if (inheritanceRow) {
+    if (currentType === "C" || currentType === "S") {
+      inheritanceRow.classList.remove("hidden");
+    } else {
+      inheritanceRow.classList.add("hidden");
+    }
+  }
+
+  // Reveal action UI that was hidden during the initial loading skeleton.
+  const copyUrlBtn = document.getElementById("copy-url");
+  if (copyUrlBtn) copyUrlBtn.classList.remove("hidden");
+
+  // Selection tabs (Overview / Struct / MDK) only apply to classes & structs.
+  // Functions/Enums remove the element entirely further down the call chain.
+  const selectionTabs = document.getElementById("selection-tabs");
+  if (selectionTabs && (currentType === "C" || currentType === "S")) {
+    selectionTabs.classList.remove("hidden");
+  }
+
+  // Only reveal #overview-items if no other tab is currently active.
+  // Otherwise switching classes while on Struct/MDK would unhide overview
+  // on top of the active tab.
+  const overviewItems = document.getElementById("overview-items");
+  const structVisible =
+    document.getElementById("struct-items") &&
+    !document.getElementById("struct-items").classList.contains("hidden");
+  const mdkVisible =
+    document.getElementById("MDK-items") &&
+    !document.getElementById("MDK-items").classList.contains("hidden");
+  if (overviewItems && !structVisible && !mdkVisible) {
+    overviewItems.classList.remove("hidden");
+  }
+
   if (currentType === "C" || currentType === "S")
     displayMembers(CName, targetGameClass);
   if (currentType === "F") displayFunctions(CName, targetGameClass);
@@ -578,7 +699,7 @@ const emtpyOverViewDivChildren = Array.from(
   document.getElementById("overview-items").children,
 );
 
-function displayOverviewPage(members) {
+function displayOverviewPage(CName, members) {
   const itemsOverviewDiv = document.getElementById("overview-items");
   //remove old children
   while (itemsOverviewDiv.firstChild) {
@@ -587,6 +708,72 @@ function displayOverviewPage(members) {
   for (const child of emtpyOverViewDivChildren) {
     itemsOverviewDiv.appendChild(child);
   }
+
+  // If we're in diff mode and the class itself is deleted, render its OLD
+  // members instead of the (nonexistent) current ones, with everything red.
+  const diffEntry =
+    diffSummary && CName ? diffSummary.get(CName) : null;
+  const innerDiffs = diffEntry ? diffEntry.innerDiffs : null;
+  const parentDeleted = diffEntry && diffEntry.status === "D";
+
+  // Pre-collect deleted members and sort by their original offset so we can
+  // interleave them between live members (so a member that lived at 0x40
+  // shows up between the live members at 0x38 and 0x48 — not at the bottom).
+  const deletedRows = [];
+  if (innerDiffs && !parentDeleted) {
+    for (const [delName, mDiff] of innerDiffs) {
+      if (mDiff.status !== "D") continue;
+      if (!Array.isArray(mDiff.oldValue)) continue;
+      const offset =
+        typeof mDiff.oldValue[1] === "number" ? mDiff.oldValue[1] : 0;
+      deletedRows.push({ delName, ov: mDiff.oldValue, offset });
+    }
+    deletedRows.sort((a, b) => a.offset - b.offset);
+  }
+  let delPtr = 0;
+
+  // Helper: render one deleted-member row at the current insertion point.
+  function appendDeletedRowOverview({ delName, ov }) {
+    const row = document.createElement("div");
+    row.className =
+      "max-sm:w-[70vh] grid grid-cols-8 text-sm px-2 sm:px-6 pt-2 pb-2 " +
+      "border-b border-gray-200 dark:border-gray-600 " +
+      "bg-red-50/50 dark:bg-red-950/20 " +
+      "text-red-700 dark:text-red-400 relative";
+
+    const marker = document.createElement("span");
+    marker.className =
+      "absolute left-0 sm:left-2 top-1/2 -translate-y-1/2 font-mono font-bold text-base leading-none text-red-600 dark:text-red-400";
+    marker.textContent = "−";
+    row.appendChild(marker);
+
+    const typeArr = ov[0];
+    const typeP = document.createElement("p");
+    typeP.className = "col-span-3 truncate";
+    typeP.textContent =
+      (typeArr && typeArr[0] ? typeArr[0] : "") +
+      (typeArr && typeArr[2] === "*" ? "*" : "");
+    row.appendChild(typeP);
+
+    const nameP = document.createElement("p");
+    nameP.className = "col-span-3 truncate";
+    nameP.textContent = delName;
+    row.appendChild(nameP);
+
+    const offP = document.createElement("p");
+    offP.className = "col-span-1 font-mono";
+    offP.textContent = "0x" + (ov[1] || 0).toString(16);
+    row.appendChild(offP);
+
+    const szP = document.createElement("p");
+    szP.className = "col-span-1 pl-8 font-mono";
+    szP.textContent = String(ov[2] != null ? ov[2] : "");
+    row.appendChild(szP);
+
+    itemsOverviewDiv.appendChild(row);
+    if (!focusFound) focusIdx++;
+  }
+
   var focusIdx = 0;
   var focusFound = false;
   var memberItemHeight = 0;
@@ -594,6 +781,21 @@ function displayOverviewPage(members) {
     const memberName = Object.keys(member)[0];
     if (memberName === "__InheritInfo") continue;
     if (memberName === "__MDKClassSize") continue;
+
+    // Look up this member's diff status (if any).
+    const memberDiff = innerDiffs ? innerDiffs.get(memberName) : null;
+
+    // Flush any deleted members whose original offset is at or before this
+    // live member's offset — they belong above it in the file order.
+    const liveOffset =
+      typeof member[memberName][1] === "number" ? member[memberName][1] : 0;
+    while (
+      delPtr < deletedRows.length &&
+      deletedRows[delPtr].offset <= liveOffset
+    ) {
+      appendDeletedRowOverview(deletedRows[delPtr]);
+      delPtr++;
+    }
 
     const overviewMemberDiv = document.createElement("div");
     overviewMemberDiv.classList.add(
@@ -610,7 +812,22 @@ function displayOverviewPage(members) {
       "border-b",
       "border-gray-200",
       "dark:border-gray-600",
+      "relative",
     );
+    if (memberDiff && memberDiff.status !== "U") {
+      const { row } = getDiffStatusClasses(memberDiff.status);
+      if (row) overviewMemberDiv.classList.add(...row.split(" "));
+    }
+    // Diff marker (+/−) lives absolutely at the row's left edge, ignoring the
+    // row's horizontal padding so it sits at column 0 like a git diff marker.
+    if (memberDiff && (memberDiff.status === "A" || memberDiff.status === "D")) {
+      const { marker, markerChar } = getDiffStatusClasses(memberDiff.status);
+      const markerEl = document.createElement("span");
+      markerEl.className =
+        "absolute left-0 sm:left-2 top-1/2 -translate-y-1/2 font-mono font-bold text-base leading-none " + marker;
+      markerEl.textContent = markerChar;
+      overviewMemberDiv.appendChild(markerEl);
+    }
 
     const memberTypeDiv = document.createElement("div");
     memberTypeDiv.classList.add("col-span-3", "flex");
@@ -703,6 +920,15 @@ function displayOverviewPage(members) {
 
     memberNameDiv.appendChild(memberNameP);
 
+    // Rename annotation: "(was: oldName)" for case-only renames.
+    if (memberDiff && memberDiff.renamedFrom) {
+      const renameNote = document.createElement("span");
+      renameNote.className =
+        "ml-2 text-xs italic text-slate-500 dark:text-slate-400";
+      renameNote.textContent = "(was: " + memberDiff.renamedFrom + ")";
+      memberNameDiv.appendChild(renameNote);
+    }
+
     if (UrlParams["member"]) {
       if (memberName === UrlParams["member"]) {
         overviewMemberDiv.classList.add("bg-sky-400/10");
@@ -784,12 +1010,57 @@ function displayOverviewPage(members) {
         memberOffsetP.textContent += " : " + member[memberName][4];
       }
     }
+    // If the offset changed in this diff, replace the cell with "old → new".
+    if (
+      memberDiff &&
+      memberDiff.status === "M" &&
+      memberDiff.oldValue &&
+      memberDiff.newValue &&
+      memberDiff.oldValue[1] !== memberDiff.newValue[1]
+    ) {
+      memberOffsetP.innerHTML = "";
+      const oldOff = document.createElement("span");
+      oldOff.className = "text-red-500 dark:text-red-400 mr-1";
+      oldOff.textContent = "0x" + memberDiff.oldValue[1].toString(16);
+      const arrow = document.createElement("span");
+      arrow.className = "text-slate-400 mr-1";
+      arrow.textContent = "→";
+      const newOff = document.createElement("span");
+      newOff.className = "text-green-700 dark:text-green-400 font-semibold";
+      newOff.textContent = "0x" + memberDiff.newValue[1].toString(16);
+      memberOffsetP.appendChild(oldOff);
+      memberOffsetP.appendChild(arrow);
+      memberOffsetP.appendChild(newOff);
+    }
     overviewMemberDiv.appendChild(memberOffsetP);
 
     const memberSizeP = document.createElement("p");
     memberSizeP.classList.add("col-span-1", "pl-8", "font-mono");
     const memberSizeVal = member[Object.keys(member)[0]][2];
     memberSizeP.textContent = memberSizeVal;
+    if (
+      memberDiff &&
+      memberDiff.status === "M" &&
+      memberDiff.oldValue &&
+      memberDiff.newValue &&
+      memberDiff.oldValue[2] !== memberDiff.newValue[2]
+    ) {
+      memberSizeP.innerHTML = "";
+      memberSizeP.classList.remove("pl-8");
+      const oldSz = document.createElement("span");
+      oldSz.className = "text-red-500 dark:text-red-400 mr-1";
+      oldSz.textContent = String(memberDiff.oldValue[2]);
+      const arrow = document.createElement("span");
+      arrow.className = "text-slate-400 mr-1";
+      arrow.textContent = "→";
+      const newSz = document.createElement("span");
+      newSz.className = "text-green-700 dark:text-green-400 font-semibold";
+      newSz.textContent = String(memberDiff.newValue[2]);
+      memberSizeP.appendChild(oldSz);
+      memberSizeP.appendChild(arrow);
+      memberSizeP.appendChild(newSz);
+      memberSizeP.classList.add("col-span-1", "font-mono");
+    }
     if (memberSizeVal < 10) memberSizeP.textContent += "\u00A0";
     if (memberSizeVal < 100) memberSizeP.textContent += "\u00A0";
 
@@ -815,6 +1086,13 @@ function displayOverviewPage(members) {
       memberItemHeight = overviewMemberDiv.getBoundingClientRect().height;
     }
   }
+
+  // Drain any deleted members whose offset comes after every live member.
+  while (delPtr < deletedRows.length) {
+    appendDeletedRowOverview(deletedRows[delPtr]);
+    delPtr++;
+  }
+
   if (focusFound) {
     const memberList = document.getElementById("member-list");
     const rect = memberList.getBoundingClientRect();
@@ -957,15 +1235,26 @@ function displayStructAndMDKPage(CName, members) {
   textAreaSDKRows++;
   textAreaMDKRows += 2;
 
-  var SDKTextArea = document.getElementById("struct-items-textarea");
-  if (SDKTextArea != null) {
-    SDKTextArea.textContent = textAreaSDKText;
-    SDKTextArea.rows = textAreaSDKRows;
-  }
-  var MDKTextArea = document.getElementById("MDK-items-textarea");
-  if (MDKTextArea != null) {
-    MDKTextArea.textContent = textAreaMDKText;
-    MDKTextArea.rows = textAreaMDKRows;
+  applyCppHighlight("struct-items-textarea", textAreaSDKText);
+  applyCppHighlight("MDK-items-textarea", textAreaMDKText);
+}
+
+// Set source on a <code> block and re-run highlight.js. We have to clear the
+// "already highlighted" sentinel because hljs.highlightElement is a no-op
+// once it has been applied to an element.
+function applyCppHighlight(elementId, text) {
+  const el = document.getElementById(elementId);
+  if (!el) return;
+  el.textContent = text;
+  if (el.dataset) delete el.dataset.highlighted;
+  el.removeAttribute("data-highlighted");
+  el.className = "language-cpp";
+  if (typeof hljs !== "undefined") {
+    try {
+      hljs.highlightElement(el);
+    } catch (e) {
+      console.warn("[hljs] highlight failed", e);
+    }
   }
 }
 
@@ -1016,7 +1305,7 @@ function displayMembers(CName, data) {
     }
   }
 
-  displayOverviewPage(members);
+  displayOverviewPage(CName, members);
   displayStructAndMDKPage(CName, members);
 
   if (document.getElementById("overview-items-skeleton") != null) {
@@ -1138,29 +1427,117 @@ function displayEnums(CName, data) {
 
   enumDiv.appendChild(enumCopyButton);
 
+  // Diff context for this enum (name keyed → {status, oldValue, newValue}).
+  const eDiffEntry = diffSummary && CName ? diffSummary.get(CName) : null;
+  const eInnerDiffs = eDiffEntry ? eDiffEntry.innerDiffs : null;
+
   const enumFooterDiv = document.createElement("div");
   enumFooterDiv.classList.add("grid", "grid-cols-8", "mx-10");
   var enuItemCount = 0;
   for (const _enu of enumItems) {
     const enu = _enu[Object.keys(_enu)];
+    const itemKey = Object.keys(_enu)[0];
+    const itemDiff = eInnerDiffs ? eInnerDiffs.get(itemKey) : null;
+
     const enuItemNameP = document.createElement("p");
     enuItemNameP.classList.add(
       "col-span-7",
       "sm:col-span-6",
       "text-left",
       "truncate",
+      "flex",
+      "items-center",
     );
-    enuItemNameP.textContent = Object.keys(_enu);
+    // Diff line marker for added enum items.
+    if (itemDiff && itemDiff.status === "A") {
+      const m = document.createElement("span");
+      m.className = "font-mono font-bold mr-2 text-green-600 dark:text-green-400";
+      m.textContent = "+";
+      enuItemNameP.appendChild(m);
+    }
+    const enuName = document.createElement("span");
+    enuName.className = "truncate";
+    enuName.textContent = itemKey;
+    enuItemNameP.appendChild(enuName);
+    if (itemDiff && itemDiff.status === "A") {
+      enuItemNameP.classList.add(
+        "text-green-700",
+        "dark:text-green-400",
+        "font-semibold",
+      );
+    } else if (itemDiff && itemDiff.status === "M") {
+      enuItemNameP.classList.add(
+        "text-amber-700",
+        "dark:text-amber-400",
+        "font-semibold",
+      );
+    }
+    if (itemDiff && itemDiff.renamedFrom) {
+      const renameNote = document.createElement("span");
+      renameNote.className =
+        "ml-2 text-xs italic text-slate-500 dark:text-slate-400";
+      renameNote.textContent = "(was: " + itemDiff.renamedFrom + ")";
+      enuItemNameP.appendChild(renameNote);
+    }
     enumFooterDiv.appendChild(enuItemNameP);
     const enuItemValueP = document.createElement("p");
     enuItemValueP.classList.add("col-span-1", "sm:col-span-2");
 
-    if (enuItemCount < enumItems.length - 1)
-      enuItemValueP.textContent = "= " + enu + ",";
-    else enuItemValueP.textContent = "= " + enu;
+    const trailingComma = enuItemCount < enumItems.length - 1 ? "," : "";
+
+    if (
+      itemDiff &&
+      itemDiff.status === "M" &&
+      itemDiff.oldValue !== itemDiff.newValue
+    ) {
+      enuItemValueP.innerHTML = "";
+      const eq = document.createElement("span");
+      eq.textContent = "= ";
+      const oldV = document.createElement("span");
+      oldV.className = "text-red-500 dark:text-red-400 mr-1";
+      oldV.textContent = String(itemDiff.oldValue);
+      const arrow = document.createElement("span");
+      arrow.className = "text-slate-400 mr-1";
+      arrow.textContent = "→";
+      const newV = document.createElement("span");
+      newV.className = "text-green-700 dark:text-green-400 font-semibold";
+      newV.textContent = String(itemDiff.newValue) + trailingComma;
+      enuItemValueP.appendChild(eq);
+      enuItemValueP.appendChild(oldV);
+      enuItemValueP.appendChild(arrow);
+      enuItemValueP.appendChild(newV);
+    } else {
+      enuItemValueP.textContent = "= " + enu + trailingComma;
+    }
 
     enumFooterDiv.appendChild(enuItemValueP);
     enuItemCount++;
+  }
+
+  // Append rows for enum values that were deleted in this diff. Skip when
+  // the whole enum was deleted — its items were already iterated above.
+  const enumParentDeleted = eDiffEntry && eDiffEntry.status === "D";
+  if (eInnerDiffs && !enumParentDeleted) {
+    for (const [delKey, dDiff] of eInnerDiffs) {
+      if (dDiff.status !== "D") continue;
+      const delNameP = document.createElement("p");
+      delNameP.className =
+        "col-span-7 sm:col-span-6 text-left truncate text-red-700 dark:text-red-400 flex items-center";
+      const m = document.createElement("span");
+      m.className = "font-mono font-bold mr-2 text-red-600 dark:text-red-400";
+      m.textContent = "−";
+      delNameP.appendChild(m);
+      const delName = document.createElement("span");
+      delName.className = "truncate";
+      delName.textContent = delKey;
+      delNameP.appendChild(delName);
+      enumFooterDiv.appendChild(delNameP);
+      const delValP = document.createElement("p");
+      delValP.className =
+        "col-span-1 sm:col-span-2 text-red-700 dark:text-red-400";
+      delValP.textContent = "= " + String(dDiff.oldValue);
+      enumFooterDiv.appendChild(delValP);
+    }
   }
 
   const enumClosureP = document.createElement("p");
@@ -1202,9 +1579,14 @@ function displayFunctions(CName, data) {
 
   const funcs = data[Object.keys(data)[0]];
 
+  // Diff context for this class.
+  const diffEntry = diffSummary && CName ? diffSummary.get(CName) : null;
+  const innerDiffs = diffEntry ? diffEntry.innerDiffs : null;
+
   var moveTo = 0;
   for (const func of funcs) {
     const funcName = Object.keys(func)[0];
+    const fnDiff = innerDiffs ? innerDiffs.get(funcName) : null;
 
     const coreDiv = document.createElement("div");
     coreDiv.classList.add(
@@ -1215,7 +1597,22 @@ function displayFunctions(CName, data) {
       "px-4",
       "text-slate-700",
       "dark:text-slate-100",
+      "relative",
     );
+    if (fnDiff && fnDiff.status !== "U") {
+      const { row } = getDiffStatusClasses(fnDiff.status);
+      if (row) coreDiv.classList.add(...row.split(" "));
+    }
+    // Diff marker (+/−) absolute-positioned at the row's left edge, ignoring
+    // the row's padding so it sits at column 0.
+    if (fnDiff && (fnDiff.status === "A" || fnDiff.status === "D")) {
+      const { marker, markerChar } = getDiffStatusClasses(fnDiff.status);
+      const fnMarkerEl = document.createElement("span");
+      fnMarkerEl.className =
+        "absolute left-0 sm:left-2 top-1/2 -translate-y-1/2 font-mono font-bold text-base leading-none " + marker;
+      fnMarkerEl.textContent = markerChar;
+      coreDiv.appendChild(fnMarkerEl);
+    }
 
     const offsetDiv = document.createElement("div");
     offsetDiv.classList.add("flex", "space-x-4");
@@ -1237,6 +1634,39 @@ function displayFunctions(CName, data) {
         showToast("Copied offset to clipboard!", false);
       }.bind(null, offsetButton.textContent),
     );
+
+    // When the offset changed in this diff, render "old → new" with the old
+    // offset BEFORE the (now green) current one — same layout as overview.
+    const offsetChanged =
+      fnDiff &&
+      fnDiff.status === "M" &&
+      fnDiff.oldValue &&
+      fnDiff.newValue &&
+      fnDiff.oldValue[2] !== fnDiff.newValue[2];
+    let oldOffsetEl = null;
+    let arrowEl = null;
+    if (offsetChanged) {
+      oldOffsetEl = document.createElement("span");
+      oldOffsetEl.className = "text-red-500 dark:text-red-400";
+      oldOffsetEl.textContent = "0x" + fnDiff.oldValue[2].toString(16);
+      arrowEl = document.createElement("span");
+      arrowEl.className = "text-slate-400";
+      arrowEl.textContent = "→";
+      offsetButton.classList.add(
+        "text-green-700",
+        "dark:text-green-400",
+        "font-semibold",
+      );
+    }
+
+    // Rename annotation: "(was: oldName)" for case-only function renames.
+    let renameNoteEl = null;
+    if (fnDiff && fnDiff.renamedFrom) {
+      renameNoteEl = document.createElement("p");
+      renameNoteEl.className =
+        "text-xs italic text-slate-500 dark:text-slate-400 ml-2";
+      renameNoteEl.textContent = "(was: " + fnDiff.renamedFrom + ")";
+    }
     const functionFlags = document.createElement("p");
     functionFlags.classList.add(
       "text-slate-600",
@@ -1247,7 +1677,10 @@ function displayFunctions(CName, data) {
     functionFlags.textContent = func[funcName][3];
 
     offsetDiv.appendChild(offsetP);
+    if (oldOffsetEl) offsetDiv.appendChild(oldOffsetEl);
+    if (arrowEl) offsetDiv.appendChild(arrowEl);
     offsetDiv.appendChild(offsetButton);
+    if (renameNoteEl) offsetDiv.appendChild(renameNoteEl);
     offsetDiv.appendChild(functionFlags);
 
     const functionLinkButton = document.createElement("button");
@@ -1488,6 +1921,43 @@ function displayFunctions(CName, data) {
     }
   }
 
+  // Append rows for functions that were deleted in this diff. Just show the
+  // signature outline (offset, name) — sufficient for diff context.
+  // Skip when the entire class is deleted — its functions were already iterated.
+  const fnParentDeleted = diffEntry && diffEntry.status === "D";
+  if (innerDiffs && !fnParentDeleted) {
+    for (const [delName, fnDiff] of innerDiffs) {
+      if (fnDiff.status !== "D") continue;
+      const ov = fnDiff.oldValue;
+      if (!Array.isArray(ov)) continue;
+
+      const row = document.createElement("div");
+      row.className =
+        "border-b border-gray-200 dark:border-gray-600 py-2 px-4 " +
+        "bg-red-50/50 dark:bg-red-950/20 " +
+        "text-red-700 dark:text-red-400 relative";
+
+      const marker = document.createElement("span");
+      marker.className =
+        "absolute left-0 sm:left-2 top-1/2 -translate-y-1/2 font-mono font-bold text-base leading-none text-red-600 dark:text-red-400";
+      marker.textContent = "−";
+      row.appendChild(marker);
+
+      const head = document.createElement("p");
+      head.className = "font-semibold";
+      head.textContent = "Function offset: 0x" + (ov[2] || 0).toString(16);
+      row.appendChild(head);
+
+      const sig = document.createElement("p");
+      sig.className = "truncate";
+      const retType = Array.isArray(ov[0]) ? ov[0][0] : "";
+      sig.textContent = retType + " " + delName + "(...)";
+      row.appendChild(sig);
+
+      itemsOverviewDiv.appendChild(row);
+    }
+  }
+
   if (moveTo > 0) {
     document.getElementById("member-list").scrollTop =
       moveTo -
@@ -1609,7 +2079,15 @@ function showOffsets(credit, dataJSON) {
     "text-slate-700",
     "dark:text-slate-100",
   );
+  function fmtOffsetVal(v) {
+    return typeof v === "number" && !Number.isNaN(v)
+      ? "0x" + v.toString(16)
+      : String(v);
+  }
+
   for (const offset of dataJSON) {
+    const oDiff = diffSummary ? diffSummary.get(offset[0]) : null;
+
     const offsetDiv = document.createElement("div");
     offsetDiv.classList.add(
       "border-b",
@@ -1618,17 +2096,49 @@ function showOffsets(credit, dataJSON) {
       "flex",
       "justify-between",
       "py-3",
+      "relative",
     );
+    if (oDiff && oDiff.status !== "U") {
+      const { row } = getDiffStatusClasses(oDiff.status);
+      if (row) offsetDiv.classList.add(...row.split(" "));
+    }
+    if (oDiff && (oDiff.status === "A" || oDiff.status === "D")) {
+      const { marker, markerChar } = getDiffStatusClasses(oDiff.status);
+      const markerEl = document.createElement("span");
+      markerEl.className =
+        "absolute left-0 sm:left-2 top-1/2 -translate-y-1/2 font-mono font-bold text-base leading-none " +
+        marker;
+      markerEl.textContent = markerChar;
+      offsetDiv.appendChild(markerEl);
+    }
+
     const offsetNameP = document.createElement("p");
     offsetNameP.classList.add("self-center", "font-semibold");
     offsetNameP.textContent = offset[0];
 
     const offsetNumP = document.createElement("p");
-    offsetNumP.classList.add("self-center", "pr-4");
-    if (typeof offset[1] === "number" && !Number.isNaN(offset[1])) {
-      offsetNumP.textContent = "0x" + offset[1].toString(16);
+    offsetNumP.classList.add("self-center", "pr-4", "flex", "items-center", "gap-2");
+    if (
+      oDiff &&
+      oDiff.status === "M" &&
+      oDiff.oldValue &&
+      oDiff.newValue &&
+      oDiff.oldValue[1] !== oDiff.newValue[1]
+    ) {
+      const oldEl = document.createElement("span");
+      oldEl.className = "text-red-500 dark:text-red-400";
+      oldEl.textContent = fmtOffsetVal(oDiff.oldValue[1]);
+      const arrowEl = document.createElement("span");
+      arrowEl.className = "text-slate-400";
+      arrowEl.textContent = "→";
+      const newEl = document.createElement("span");
+      newEl.className = "text-green-700 dark:text-green-400 font-semibold";
+      newEl.textContent = fmtOffsetVal(oDiff.newValue[1]);
+      offsetNumP.appendChild(oldEl);
+      offsetNumP.appendChild(arrowEl);
+      offsetNumP.appendChild(newEl);
     } else {
-      offsetNumP.textContent = offset[1];
+      offsetNumP.textContent = fmtOffsetVal(offset[1]);
     }
 
     const rightSideDiv = document.createElement("div");
@@ -1696,6 +2206,38 @@ function showOffsets(credit, dataJSON) {
 
     fullOffsetDiv.appendChild(offsetDiv);
   }
+
+  // Append rows for offsets that were deleted in this diff.
+  if (diffSummary) {
+    for (const [delName, dDiff] of diffSummary) {
+      if (dDiff.status !== "D") continue;
+      const ov = dDiff.oldValue;
+      if (!Array.isArray(ov)) continue;
+      const row = document.createElement("div");
+      row.className =
+        "border-b border-gray-200 dark:border-gray-600 flex justify-between py-3 " +
+        "bg-red-50/50 dark:bg-red-950/20 text-red-700 dark:text-red-400 relative";
+
+      const marker = document.createElement("span");
+      marker.className =
+        "absolute left-0 sm:left-2 top-1/2 -translate-y-1/2 font-mono font-bold text-base leading-none text-red-600 dark:text-red-400";
+      marker.textContent = "−";
+      row.appendChild(marker);
+
+      const nameP = document.createElement("p");
+      nameP.className = "self-center font-semibold";
+      nameP.textContent = delName;
+      row.appendChild(nameP);
+
+      const valP = document.createElement("p");
+      valP.className = "self-center pr-4";
+      valP.textContent = fmtOffsetVal(ov[1]);
+      row.appendChild(valP);
+
+      fullOffsetDiv.appendChild(row);
+    }
+  }
+
   viewer.appendChild(fullOffsetDiv);
   if (credit !== undefined) {
     const creditDiv = document.createElement("div");
@@ -1770,22 +2312,50 @@ const toastCheck = document.getElementById("toast-check");
 const toastError = document.getElementById("toast-error");
 const toastDivText = document.getElementById("toast-div-text");
 
-toastDiv.addEventListener("click", function () {
-  // Show the floating div
-  toastDiv.classList.remove("opacity-100");
-  toastDiv.classList.add("opacity-0");
+// Toast lifecycle: auto-dismiss after 3s, hover pauses, click dismisses now.
+let toastHideTimer = null;
+
+function hideToastNow() {
+  if (toastHideTimer) {
+    clearTimeout(toastHideTimer);
+    toastHideTimer = null;
+  }
+  toastDiv.classList.remove("opacity-100", "translate-y-0", "pointer-events-auto");
+  toastDiv.classList.add("opacity-0", "translate-y-3", "pointer-events-none");
+}
+
+function scheduleToastHide(ms = 3000) {
+  if (toastHideTimer) clearTimeout(toastHideTimer);
+  toastHideTimer = setTimeout(hideToastNow, ms);
+}
+
+toastDiv.addEventListener("mouseenter", function () {
+  if (toastHideTimer) {
+    clearTimeout(toastHideTimer);
+    toastHideTimer = null;
+  }
 });
+toastDiv.addEventListener("mouseleave", function () {
+  scheduleToastHide();
+});
+toastDiv.addEventListener("click", hideToastNow);
 
 document.getElementById("copy-url").addEventListener("click", function () {
   navigator.clipboard.writeText(window.location.href);
   showToast("Copied URL to clipboard!", false);
 });
 
+function copyTextareaToClipboard(elementId, label) {
+  const el = document.getElementById(elementId);
+  if (!el) return;
+  // Works for both <textarea> (.value) and <pre><code> (.textContent).
+  const text = el.value !== undefined ? el.value : el.textContent;
+  navigator.clipboard.writeText(text);
+  showToast(label, false);
+}
+
 function showToast(name, error = true) {
-  if (toastDiv != null) {
-    toastDiv.classList.remove("opacity-0");
-  }
-  toastDiv.classList.add("opacity-100");
+  if (toastDiv == null) return;
 
   if (toastDivText != null) toastDivText.textContent = name;
 
@@ -1796,6 +2366,12 @@ function showToast(name, error = true) {
     toastError.classList.add("hidden");
     toastCheck.classList.remove("hidden");
   }
+
+  // Reveal: slide up + fade in via the transition classes on the wrapper.
+  toastDiv.classList.remove("opacity-0", "translate-y-3", "pointer-events-none");
+  toastDiv.classList.add("opacity-100", "translate-y-0", "pointer-events-auto");
+
+  scheduleToastHide();
 }
 
 const searchInput = document.getElementById("class-search-input");
@@ -1817,8 +2393,6 @@ function handleSearchInput() {
     }
   }
   dVanillaRecyclerView.setData(formattedArrayDataRef);
-  dVanillaRecyclerView.calculateSize();
-
   classDiv.scrollTop = 0;
 }
 searchCancelButton.addEventListener("click", function () {
@@ -1873,6 +2447,21 @@ function toggleInheritanceView() {
   handleInheritanceView();
 }
 
+// Holds the current Cytoscape instance so we can tear it down before re-rendering.
+let inheritanceCy = null;
+
+// Register the dagre layout extension once the libraries are loaded.
+let inheritanceDagreReady = false;
+function ensureInheritanceDagre() {
+  if (inheritanceDagreReady) return true;
+  if (typeof cytoscape === "undefined" || typeof cytoscapeDagre === "undefined") {
+    return false;
+  }
+  cytoscape.use(cytoscapeDagre);
+  inheritanceDagreReady = true;
+  return true;
+}
+
 function handleInheritanceView() {
   const innerDiv = document.getElementById("InheritanceViewerInnerDiv");
   const innerIdleDiv = document.getElementById("InheritanceViewer-spinner");
@@ -1885,42 +2474,129 @@ function handleInheritanceView() {
   const selectedValue = Number(
     document.querySelector(`label[for="${selectedRadio.id}"]`).textContent || 0,
   );
-  console.log(`select: ${selectedValue}`);
 
-  innerDiv.textContent = "";
-  const search = document.getElementById("class-desc-name").textContent;
-  const names = [];
-  let mermaidDefinition = "graph LR\n";
-
-  function addInstances(inher, i) {
-    for (const inher2 of findInheritances(inher)) {
-      mermaidDefinition += `${inher} --> ${inher2}\n`;
-      if (i > 0) {
-        addInstances(inher2, i - 1);
-      }
+  // Walk descendants (same direction as the old Mermaid graph).
+  const root = document.getElementById("class-desc-name").textContent;
+  const nodeIds = new Set([root]);
+  const edges = [];
+  function addInstances(parent, depthLeft) {
+    for (const child of findInheritances(parent)) {
+      edges.push({
+        data: { id: parent + "->" + child, source: parent, target: child },
+      });
+      nodeIds.add(child);
+      if (depthLeft > 0) addInstances(child, depthLeft - 1);
     }
   }
+  addInstances(root, selectedValue - 1);
 
-  addInstances(search, selectedValue - 1);
+  if (!ensureInheritanceDagre()) {
+    showToast("Inheritance graph library failed to load.");
+    return;
+  }
 
-  innerDiv.innerHTML = mermaidDefinition;
+  // Tear down any previous instance.
+  if (inheritanceCy) {
+    inheritanceCy.destroy();
+    inheritanceCy = null;
+  }
+  innerDiv.innerHTML = "";
 
-  innerDiv.classList.add("mermaid");
-  //console.log(mermaidDefinition);
-  innerDiv.removeAttribute("data-processed");
-  mermaid.contentLoaded();
+  // Reveal the container BEFORE mounting so Cytoscape can measure it.
   innerDiv.classList.remove("hidden");
   innerIdleDiv.classList.add("hidden");
+
+  const isDark = document.documentElement.classList.contains("dark");
+  const nodeBg = isDark ? "#1e293b" : "#f8fafc"; // slate-800 / slate-50
+  const nodeBorder = isDark ? "#475569" : "#cbd5e1"; // slate-600 / slate-300
+  const nodeText = isDark ? "#f1f5f9" : "#1e293b"; // slate-100 / slate-800
+  const rootBg = "#1d4ed8"; // blue-700
+  const edgeColor = isDark ? "#64748b" : "#94a3b8"; // slate-500 / slate-400
+
+  // requestAnimationFrame ensures the unhide above has been flushed so the
+  // container reports its real size when Cytoscape mounts.
+  requestAnimationFrame(() => {
+    inheritanceCy = cytoscape({
+      container: innerDiv,
+      elements: {
+        nodes: [...nodeIds].map((id) => ({
+          data: { id, label: id, isRoot: id === root },
+        })),
+        edges,
+      },
+      layout: {
+        name: "dagre",
+        rankDir: "LR",
+        nodeSep: 24,
+        rankSep: 90,
+        animate: false,
+      },
+      style: [
+        {
+          selector: "node",
+          style: {
+            shape: "round-rectangle",
+            "background-color": nodeBg,
+            "border-color": nodeBorder,
+            "border-width": 1,
+            color: nodeText,
+            label: "data(label)",
+            "text-valign": "center",
+            "text-halign": "center",
+            "font-size": "13px",
+            "font-family": "Inter, ui-sans-serif, sans-serif",
+            "font-weight": 500,
+            padding: "10px",
+            width: "label",
+            height: "label",
+            "text-wrap": "none",
+          },
+        },
+        {
+          selector: "node[?isRoot]",
+          style: {
+            "background-color": rootBg,
+            "border-color": rootBg,
+            color: "#ffffff",
+            "font-weight": 700,
+          },
+        },
+        {
+          selector: "node:active",
+          style: { "overlay-opacity": 0 },
+        },
+        {
+          selector: "edge",
+          style: {
+            "curve-style": "bezier",
+            "target-arrow-shape": "triangle",
+            "target-arrow-color": edgeColor,
+            "line-color": edgeColor,
+            width: 1.5,
+          },
+        },
+      ],
+      wheelSensitivity: 0.2,
+      minZoom: 0.2,
+      maxZoom: 3,
+    });
+
+    // Click any non-root node to navigate to it in-place (no page reload).
+    // The graph only contains classes from the currently loaded type, so we
+    // can reuse the same pattern the class-list buttons use.
+    inheritanceCy.on("tap", "node", function (event) {
+      const name = event.target.id();
+      if (!name || name === root) return;
+      focussedCName = name;
+      fixHighlightColor();
+      displayCurrentType(name);
+      // Close the modal so the user actually sees the new class.
+      document.getElementById("InheritanceViewerDiv").classList.add("hidden");
+    });
+
+    inheritanceCy.fit(undefined, 30);
+  });
 }
-mermaid.initialize({
-  startOnLoad: true,
-  maxTextSize: 200000,
-  theme: "default",
-  themeVariables: {
-    fontFamily: "Inter, sans-serif",
-    lineColor: "#1d4ed8",
-  },
-});
 
 async function getCommits() {
   const owner = "Spuckwaffel";
@@ -1948,6 +2624,13 @@ async function getCommits() {
 
   let nextSha = "main"; // Start from main branch (or another starting commit/branch)
   let hasMoreCommits = true;
+
+  // The "currently viewed" version: explicit ?sha= when set, otherwise
+  // implicitly the latest merge commit on main (which is what no-sha loads).
+  // We use this to disable the Compare button on whatever row IS the current
+  // version, so users can't diff a snapshot against itself.
+  const viewingSha = UrlParams["sha"] || null;
+  let isFirstMerge = true;
 
   const newURL = window.location.href;
 
@@ -1981,6 +2664,12 @@ async function getCommits() {
 
       foundMergeCommits = true;
 
+      // Decide whether this commit IS the version currently being viewed.
+      const isCurrentVersion = viewingSha
+        ? commit.sha === viewingSha
+        : isFirstMerge;
+      isFirstMerge = false;
+
       const innerDiv = document.createElement("a");
       if (newURL.includes("sha=")) {
         innerDiv.href = newURL.replace(/(sha=)[^&]*/, `$1${commit.sha}`);
@@ -1990,7 +2679,7 @@ async function getCommits() {
       }
 
       innerDiv.className =
-        "w-full grid grid-cols-3 text-sm text-slate-700 dark:text-slate-100 pt-2 pb-2 border-b border-gray-200 dark:border-gray-600";
+        "w-full grid grid-cols-4 items-center text-sm text-slate-700 dark:text-slate-100 pt-2 pb-2 border-b border-gray-200 dark:border-gray-600";
 
       const dateP = document.createElement("p");
       dateP.classList.add("font-mono");
@@ -2010,6 +2699,38 @@ async function getCommits() {
       const match = commit.commit.message.match(/from (\S+)\//);
       if (match) authorP.textContent = match[1];
       innerDiv.appendChild(authorP);
+
+      // Compare button — diffs the current view against this commit's version.
+      // Stops the surrounding <a> from navigating. Disabled when this row IS
+      // the version currently being viewed (would be a no-op diff).
+      const compareBtn = document.createElement("button");
+      compareBtn.type = "button";
+      const dateLabel = formatDate(commit.commit.author.date);
+      if (isCurrentVersion) {
+        compareBtn.className =
+          "justify-self-end text-xs px-2 py-1 bg-slate-200/50 dark:bg-slate-700/50 " +
+          "text-slate-500 dark:text-slate-400 rounded cursor-not-allowed";
+        compareBtn.textContent = "Current";
+        compareBtn.disabled = true;
+        compareBtn.title = "This is the version you're currently viewing";
+        compareBtn.addEventListener("click", function (ev) {
+          ev.preventDefault();
+          ev.stopPropagation();
+        });
+      } else {
+        compareBtn.className =
+          "justify-self-end text-xs px-2 py-1 bg-slate-200 dark:bg-slate-700 " +
+          "hover:bg-blue-500 hover:text-white dark:text-slate-100 rounded " +
+          "transition duration-200";
+        compareBtn.textContent = "Compare";
+        compareBtn.title = "Compare current version against this commit";
+        compareBtn.addEventListener("click", function (ev) {
+          ev.preventDefault();
+          ev.stopPropagation();
+          startDiff(commit.sha, dateLabel);
+        });
+      }
+      innerDiv.appendChild(compareBtn);
 
       historyDiv.appendChild(innerDiv);
     }
@@ -2031,4 +2752,419 @@ document
 
 function toggleHistoryView() {
   document.getElementById("uploadHistoryDiv").classList.add("hidden");
+}
+
+// ============================================================
+// DIFF MODE — compare current viewed type against an older commit
+// ============================================================
+
+// Diff state (only one diff active at a time, scoped to currentType).
+let diffActiveSha = null;
+let diffActiveDate = null;
+let diffSummary = null; // Map<entryName, { status, oldEntry, newEntry, innerDiffs }>
+let deletedEntryNames = []; // names present in old but missing in current
+
+// Reflect the active diff in the URL so the page state is shareable. Pass
+// null to remove the param.
+function setUrlDiffParam(sha) {
+  const u = new URL(window.location.href);
+  const currentDiff = u.searchParams.get("diff");
+  if (sha) {
+    if (currentDiff === sha) return;
+    u.searchParams.set("diff", sha);
+  } else {
+    if (!currentDiff) return;
+    u.searchParams.delete("diff");
+  }
+  history.pushState(null, "", u.toString());
+  UrlParams = getUrlParams(u.search);
+  currentURL = u.toString();
+}
+
+function typeFileForCurrent() {
+  if (currentType === "C") return "ClassesInfo.json.gz";
+  if (currentType === "S") return "StructsInfo.json.gz";
+  if (currentType === "F") return "FunctionsInfo.json.gz";
+  if (currentType === "E") return "EnumsInfo.json.gz";
+  if (currentType === "O") return "OffsetsInfo.json.gz";
+  return null;
+}
+
+// Offsets diff has a different shape — each entry is a flat [name, value]
+// tuple rather than a nested {name: body} object. Build a per-offset diff
+// map keyed by offset name.
+function buildOffsetsDiffSummary(oldData, newData) {
+  const summary = new Map();
+  const oldByName = new Map();
+  for (const o of oldData || []) {
+    if (Array.isArray(o) && o.length >= 1) oldByName.set(o[0], o);
+  }
+  const newByName = new Map();
+  for (const o of newData || []) {
+    if (Array.isArray(o) && o.length >= 1) newByName.set(o[0], o);
+  }
+  for (const [name, newVal] of newByName) {
+    if (!oldByName.has(name)) {
+      summary.set(name, { status: "A", oldValue: null, newValue: newVal });
+    } else {
+      const oldVal = oldByName.get(name);
+      const same = oldVal[1] === newVal[1];
+      summary.set(name, {
+        status: same ? "U" : "M",
+        oldValue: oldVal,
+        newValue: newVal,
+      });
+    }
+  }
+  const deletedNames = [];
+  for (const [name, oldVal] of oldByName) {
+    if (!newByName.has(name)) {
+      summary.set(name, { status: "D", oldValue: oldVal, newValue: null });
+      deletedNames.push(name);
+    }
+  }
+  return { summary, deletedNames };
+}
+
+function entriesToMap(arr) {
+  const m = new Map();
+  if (!Array.isArray(arr)) return m;
+  for (const e of arr) m.set(Object.keys(e)[0], e);
+  return m;
+}
+
+function membersArrayToMap(membersArr) {
+  const m = new Map();
+  if (!Array.isArray(membersArr)) return m;
+  for (const member of membersArr) {
+    const k = Object.keys(member)[0];
+    if (RESERVED_MEMBER_NAMES.has(k)) continue;
+    m.set(k, member[k]);
+  }
+  return m;
+}
+
+function functionsArrayToMap(funcsArr) {
+  const m = new Map();
+  if (!Array.isArray(funcsArr)) return m;
+  for (const f of funcsArr) m.set(Object.keys(f)[0], f[Object.keys(f)[0]]);
+  return m;
+}
+
+function enumValuesToMap(enumEntry) {
+  const m = new Map();
+  if (!Array.isArray(enumEntry) || !Array.isArray(enumEntry[0])) return m;
+  for (const item of enumEntry[0]) {
+    const k = Object.keys(item)[0];
+    m.set(k, item[k]);
+  }
+  return m;
+}
+
+function deepEqual(a, b) {
+  if (a === b) return true;
+  if (typeof a !== typeof b) return false;
+  if (Array.isArray(a) && Array.isArray(b)) {
+    if (a.length !== b.length) return false;
+    for (let i = 0; i < a.length; i++) if (!deepEqual(a[i], b[i])) return false;
+    return true;
+  }
+  if (a && b && typeof a === "object") {
+    const ka = Object.keys(a);
+    const kb = Object.keys(b);
+    if (ka.length !== kb.length) return false;
+    for (const k of ka) if (!deepEqual(a[k], b[k])) return false;
+    return true;
+  }
+  return false;
+}
+
+// Look for added↔deleted pairs whose names match case-insensitively (e.g.
+// "testVFX" → "TestVFX") and reclassify them as 'M' renames. Mutates the map
+// in place. Returns the names that were removed from the map (i.e. the old
+// "deleted" names that got rolled into renames).
+function pairCaseRenames(map, type, isInner) {
+  const addedByLower = new Map();
+  const deletedByLower = new Map();
+  for (const [name, entry] of map) {
+    const lower = typeof name === "string" ? name.toLowerCase() : name;
+    if (entry.status === "A") addedByLower.set(lower, name);
+    else if (entry.status === "D") deletedByLower.set(lower, name);
+  }
+  const removed = [];
+  for (const [lower, addedName] of addedByLower) {
+    const deletedName = deletedByLower.get(lower);
+    if (!deletedName || deletedName === addedName) continue;
+
+    const addedEntry = map.get(addedName);
+    const deletedEntry = map.get(deletedName);
+    if (isInner) {
+      map.set(addedName, {
+        status: "M",
+        oldValue: deletedEntry.oldValue,
+        newValue: addedEntry.newValue,
+        renamedFrom: deletedName,
+      });
+    } else {
+      const oldBody = deletedEntry.oldEntry[deletedName];
+      const newBody = addedEntry.newEntry[addedName];
+      const innerDiffs = computeInnerDiff(oldBody, newBody, type);
+      map.set(addedName, {
+        status: "M",
+        oldEntry: deletedEntry.oldEntry,
+        newEntry: addedEntry.newEntry,
+        innerDiffs,
+        renamedFrom: deletedName,
+      });
+    }
+    map.delete(deletedName);
+    removed.push(deletedName);
+  }
+  return removed;
+}
+
+// Build the inner diff map for a single entry's body. Returns Map<itemName, {status, oldValue, newValue}>.
+function computeInnerDiff(oldVal, newVal, type) {
+  let oldMap, newMap;
+  if (type === "C" || type === "S") {
+    oldMap = membersArrayToMap(oldVal);
+    newMap = membersArrayToMap(newVal);
+  } else if (type === "F") {
+    oldMap = functionsArrayToMap(oldVal);
+    newMap = functionsArrayToMap(newVal);
+  } else if (type === "E") {
+    oldMap = enumValuesToMap(oldVal);
+    newMap = enumValuesToMap(newVal);
+  } else {
+    return new Map();
+  }
+
+  const result = new Map();
+  for (const [k, nv] of newMap) {
+    if (!oldMap.has(k)) {
+      result.set(k, { status: "A", oldValue: null, newValue: nv });
+    } else {
+      const ov = oldMap.get(k);
+      const same = type === "E" ? ov === nv : deepEqual(ov, nv);
+      result.set(k, {
+        status: same ? "U" : "M",
+        oldValue: ov,
+        newValue: nv,
+      });
+    }
+  }
+  for (const [k, ov] of oldMap) {
+    if (!newMap.has(k)) {
+      result.set(k, { status: "D", oldValue: ov, newValue: null });
+    }
+  }
+
+  // Detect case-only renames between A and D entries.
+  pairCaseRenames(result, type, true);
+
+  return result;
+}
+
+function buildDiffSummary(oldData, newData, type) {
+  const summary = new Map();
+  const deletedNames = [];
+
+  const oldByName = entriesToMap(oldData);
+  const newByName = entriesToMap(newData);
+
+  for (const [name, newEntry] of newByName) {
+    if (!oldByName.has(name)) {
+      summary.set(name, {
+        status: "A",
+        oldEntry: null,
+        newEntry,
+        innerDiffs: computeInnerDiff(null, newEntry[name], type),
+      });
+    } else {
+      const oldEntry = oldByName.get(name);
+      const innerDiffs = computeInnerDiff(oldEntry[name], newEntry[name], type);
+      const hasChange = [...innerDiffs.values()].some((d) => d.status !== "U");
+      summary.set(name, {
+        status: hasChange ? "M" : "U",
+        oldEntry,
+        newEntry,
+        innerDiffs,
+      });
+    }
+  }
+  for (const [name, oldEntry] of oldByName) {
+    if (!newByName.has(name)) {
+      summary.set(name, {
+        status: "D",
+        oldEntry,
+        newEntry: null,
+        innerDiffs: computeInnerDiff(oldEntry[name], null, type),
+      });
+      deletedNames.push(name);
+    }
+  }
+
+  // Detect class-level case-only renames (e.g. testVFX → TestVFX). The
+  // renamed-from entry is folded into the new name with a 'M' status.
+  const renamedAway = new Set(pairCaseRenames(summary, type, false));
+  const filteredDeleted = deletedNames.filter((n) => !renamedAway.has(n));
+
+  return { summary, deletedNames: filteredDeleted };
+}
+
+async function startDiff(commitSha, dateLabel) {
+  const file = typeFileForCurrent();
+  if (!file) {
+    showToast("Diff is only available for classes, structs, functions, enums.");
+    return;
+  }
+  const url =
+    "https://raw.githubusercontent.com/Spuckwaffel/dumpspace/" +
+    commitSha +
+    "/Games/" +
+    rawDirectory +
+    file;
+  showToast("Loading diff…", false);
+  try {
+    const text = await decompressJSONByURL(url);
+    const oldJson = JSON.parse(text);
+    let summary, deletedNames;
+    if (currentType === "O") {
+      ({ summary, deletedNames } = buildOffsetsDiffSummary(
+        oldJson.data,
+        currentInfoJson.data,
+      ));
+    } else {
+      ({ summary, deletedNames } = buildDiffSummary(
+        oldJson.data,
+        currentInfoJson.data,
+        currentType,
+      ));
+    }
+    diffActiveSha = commitSha;
+    diffActiveDate = dateLabel;
+    diffSummary = summary;
+    deletedEntryNames = deletedNames;
+
+    setUrlDiffParam(commitSha);
+    showDiffBanner();
+    if (currentType === "O") {
+      // Offsets view doesn't have a class list — re-render the offsets layout.
+      showOffsets(currentInfoJson.credit, currentInfoJson.data);
+    } else {
+      rebuildClassListAfterDiff();
+    }
+    showToast("Diff loaded.", false);
+  } catch (e) {
+    console.error("[diff] failed", e);
+    showToast("Failed to load diff: " + e.message);
+  }
+  // Close history modal so user sees the diffed view.
+  document.getElementById("uploadHistoryDiv").classList.add("hidden");
+}
+
+function exitDiff() {
+  diffActiveSha = null;
+  diffActiveDate = null;
+  diffSummary = null;
+  deletedEntryNames = [];
+  setUrlDiffParam(null);
+  hideDiffBanner();
+  if (currentType === "O") {
+    showOffsets(currentInfoJson.credit, currentInfoJson.data);
+  } else {
+    rebuildClassListAfterDiff();
+  }
+}
+
+function showDiffBanner() {
+  const banner = document.getElementById("diff-banner");
+  const dateSpan = document.getElementById("diff-banner-date");
+  if (banner) banner.classList.remove("hidden");
+  if (dateSpan) dateSpan.textContent = diffActiveDate || "(unknown date)";
+}
+
+function hideDiffBanner() {
+  const banner = document.getElementById("diff-banner");
+  if (banner) banner.classList.add("hidden");
+}
+
+// Rebuild the VRV class-list data in place (so badges + deleted entries
+// appear / disappear) and re-render the currently focused entry. We do NOT
+// recreate the VanillaRecyclerView here — recreating inside the same
+// container leaks the old VRV's DOM and breaks scroll-area sizing
+// (manifests as a half-empty scroller).
+function rebuildClassListAfterDiff() {
+  formattedArrayData.length = 0;
+  emptyClassNames = new Set();
+
+  for (const gameClass of currentInfoJson.data) {
+    const name = Object.keys(gameClass)[0];
+    formattedArrayData.push(name);
+
+    const items = gameClass[name];
+    let isEmpty = false;
+    if (currentType === "E") {
+      isEmpty =
+        !Array.isArray(items) ||
+        !Array.isArray(items[0]) ||
+        items[0].length === 0;
+    } else if (currentType === "C" || currentType === "S") {
+      isEmpty =
+        !Array.isArray(items) ||
+        items.filter(
+          (m) => !RESERVED_MEMBER_NAMES.has(Object.keys(m)[0]),
+        ).length === 0;
+    } else {
+      isEmpty = !Array.isArray(items) || items.length === 0;
+    }
+    if (isEmpty) emptyClassNames.add(name);
+  }
+
+  if (diffSummary && deletedEntryNames.length > 0) {
+    for (const delName of deletedEntryNames) {
+      formattedArrayData.push(delName);
+    }
+  }
+
+  // VirtualList.setData invalidates every pool slot so visible rows repaint
+  // immediately — no recreate / no double-call dance needed.
+  if (dVanillaRecyclerView) {
+    dVanillaRecyclerView.setData(formattedArrayData);
+    classDiv.scrollTop = 0;
+  }
+
+  if (focussedCName) {
+    displayCurrentType(focussedCName);
+  }
+}
+
+function getDiffStatusClasses(status) {
+  if (status === "A") {
+    return {
+      badge:
+        "bg-green-200 text-green-800 dark:bg-green-900 dark:text-green-200",
+      row: "bg-green-50/50 dark:bg-green-950/20",
+      marker: "text-green-600 dark:text-green-400",
+      markerChar: "+",
+    };
+  }
+  if (status === "M") {
+    return {
+      badge:
+        "bg-amber-200 text-amber-800 dark:bg-amber-900 dark:text-amber-200",
+      row: "",
+      marker: "text-amber-600 dark:text-amber-400",
+      markerChar: "",
+    };
+  }
+  if (status === "D") {
+    return {
+      badge: "bg-red-200 text-red-800 dark:bg-red-900 dark:text-red-200",
+      row: "bg-red-50/50 dark:bg-red-950/20",
+      marker: "text-red-600 dark:text-red-400",
+      markerChar: "−",
+    };
+  }
+  return { badge: "", row: "", marker: "", markerChar: "" };
 }
